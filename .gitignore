@@ -1,4 +1,3 @@
-@"
 venv/
 .venv/
 __pycache__/
@@ -6,4 +5,7 @@ __pycache__/
 .env
 .ipynb_checkpoints/
 *.log
-"@ | Out-File -Encoding utf8 .gitignore
+
+# Large data files — too big for GitHub
+data/*.csv
+!data/sample_btc.csv
