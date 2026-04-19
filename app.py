@@ -12,6 +12,9 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from src.data_loader import load_btc_csv, DataLoadError
+from src.preprocessing import resample_granularity, train_test_split
+from src.models.prophet_model import train_prophet_auto, train_prophet_manual, make_forecast
+from src.evaluation import compute_metrics
 
 # ── Must be the very first Streamlit call ──────────────────────────────
 st.set_page_config(
@@ -25,7 +28,7 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* ---- Hide default Streamlit chrome ---- */
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
 
 /* ---- Root font & background ---- */
 html, body, [class*="css"] {
@@ -344,7 +347,7 @@ if uploaded_file is None:
             <div class="feature-item"><span class="fi-icon">📈</span>3 algorithms: Prophet, ARIMA, XGBoost</div>
             <div class="feature-item"><span class="fi-icon">📊</span>Daily · Weekly · Monthly granularity</div>
             <div class="feature-item"><span class="fi-icon">🎯</span>MAE, RMSE, MAPE, R² metrics</div>
-            <div class="feature-item"><span class="fi-icon">🔁</span>60/20/20 threefold cross-validation</div>
+            <div class="feature-item"><span class="fi-icon">🔁</span>80/20 chronological train/test split</div>
             <div class="feature-item"><span class="fi-icon">📉</span>Confidence intervals (80% – 95%)</div>
             <div class="feature-item"><span class="fi-icon">💾</span>Export forecast as CSV or PNG</div>
         </div>
@@ -470,7 +473,120 @@ with st.expander("📋 Preview Raw Data"):
     with tab2:
         st.dataframe(df["y"].describe().rename("BTC Price (USD)").to_frame(), use_container_width=True)
 
-# ── Forecast placeholder ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# FORECAST GENERATION
+# ══════════════════════════════════════════════════════════════════════
 if generate:
     st.markdown("---")
-    st.info("⚡ **Day 2:** Prophet model is being built. Come back tomorrow for live forecasts!")
+    st.subheader(f"🔮 {model_choice} Forecast — {granularity} Granularity")
+
+    if model_choice != "Prophet":
+        st.info(f"⚡ {model_choice} model coming on Day 3. Showing Prophet for now.")
+
+    # Step 1: Resample to chosen granularity (Daily / Weekly / Monthly)
+    df_resampled = resample_granularity(df, granularity)
+
+    # Step 2: Chronological 80/20 split (paper Section 3.3)
+    train, test = train_test_split(df_resampled)
+
+    # Step 3: Train Prophet (Auto mode for now)
+    with st.spinner(f"Training Prophet on {len(train):,} {granularity.lower()} records..."):
+        model, train_time = train_prophet_auto(train, confidence=confidence)
+
+    # Step 4: Forecast (test horizon + user's future horizon)
+    freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
+    total_periods = len(test) + horizon
+    forecast = make_forecast(
+        model,
+        horizon_days=total_periods,
+        freq=freq_map[granularity],
+        historical_max=df_resampled["y"].max(),
+    )
+
+    # Step 5: Compute metrics on the test set (backtesting)
+    test_forecast = forecast[forecast["ds"].isin(test["ds"])].set_index("ds")
+    test_actual = test.set_index("ds")
+    common_dates = test_actual.index.intersection(test_forecast.index)
+    metrics = compute_metrics(test_actual.loc[common_dates, "y"], test_forecast.loc[common_dates, "yhat"])
+
+    # ── Metric cards ──────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("MAE",  f"${metrics['MAE']:,.0f}",  help="Mean Absolute Error in USD")
+    m2.metric("RMSE", f"${metrics['RMSE']:,.0f}", help="Root Mean Squared Error in USD")
+    m3.metric("MAPE", f"{metrics['MAPE']:.2f}%",  help="Mean Absolute Percentage Error")
+    m4.metric("R²",   f"{metrics['R2']:.3f}",     help="Variance explained (1.0 = perfect)")
+    m5.metric("Train Time", f"{train_time:.1f}s", help="Model training duration")
+
+    # ── Forecast chart ────────────────────────────────────────────────
+    forecast_start_date = test["ds"].iloc[0]
+    fig_fc = go.Figure()
+
+    # Historical actual (gold)
+    fig_fc.add_trace(go.Scatter(
+        x=df_resampled["ds"], y=df_resampled["y"],
+        mode="lines", name="Historical",
+        line=dict(color="#f7931a", width=2),
+        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Actual: $%{y:,.2f}<extra></extra>",
+    ))
+
+    # Confidence band (filled area)
+    fig_fc.add_trace(go.Scatter(
+        x=forecast["ds"], y=forecast["yhat_upper"],
+        mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+    ))
+    fig_fc.add_trace(go.Scatter(
+        x=forecast["ds"], y=forecast["yhat_lower"],
+        mode="lines", line=dict(width=0),
+        fill="tonexty", fillcolor="rgba(56,189,248,0.15)",
+        name=f"{int(confidence*100)}% Confidence",
+        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Lower: $%{y:,.2f}<extra></extra>",
+    ))
+
+    # Forecast line (blue)
+    fig_fc.add_trace(go.Scatter(
+        x=forecast["ds"], y=forecast["yhat"],
+        mode="lines", name="Forecast",
+        line=dict(color="#38bdf8", width=2.5, dash="solid"),
+        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Predicted: $%{y:,.2f}<extra></extra>",
+    ))
+
+    # Vertical line marking forecast start (use shape + annotation to avoid add_vline date bug)
+    fig_fc.add_shape(
+        type="line",
+        x0=forecast_start_date, x1=forecast_start_date,
+        y0=0, y1=1, yref="paper",
+        line=dict(color="#a78bfa", width=2, dash="dash"),
+    )
+    fig_fc.add_annotation(
+        x=forecast_start_date, y=1, yref="paper",
+        text="Forecast Start", showarrow=False,
+        font=dict(color="#a78bfa", size=11),
+        bgcolor="rgba(13,17,23,0.8)",
+        yshift=10,
+    )
+
+    fig_fc.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,14,26,0.8)",
+        height=520,
+        margin=dict(l=10, r=10, t=20, b=10),
+        xaxis=dict(showgrid=True, gridcolor="#1e293b"),
+        yaxis=dict(
+            title="Price (USD)", showgrid=True, gridcolor="#1e293b",
+            tickprefix="$", tickformat=",.0f",
+            range=[0, max(df_resampled["y"].max(), forecast["yhat_upper"].quantile(0.99)) * 1.1],
+        ),
+        legend=dict(bgcolor="rgba(13,17,23,0.8)", bordercolor="#1e293b", borderwidth=1),
+        hovermode="x unified",
+    )
+
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+    # ── Forecast table ────────────────────────────────────────────────
+    with st.expander(f"📊 View Forecast Data ({horizon} future periods)"):
+        future_only = forecast[forecast["ds"] > df_resampled["ds"].max()].copy()
+        future_only.columns = ["Date", "Predicted Price", "Lower Bound", "Upper Bound"]
+        for col in ["Predicted Price", "Lower Bound", "Upper Bound"]:
+            future_only[col] = future_only[col].apply(lambda x: f"${x:,.2f}")
+        st.dataframe(future_only.head(horizon), use_container_width=True, hide_index=True)
