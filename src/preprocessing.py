@@ -37,8 +37,8 @@ def train_test_split(
     """
     if not 0 < train_ratio < 1:
         raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
-    if len(df) < 30:
-        raise ValueError(f"Need at least 30 rows for split, got {len(df)}")
+    if len(df) < 20:
+        raise ValueError(f"Need at least 20 rows for split, got {len(df)}")
 
     split_idx = int(len(df) * train_ratio)
     train = df.iloc[:split_idx].copy()

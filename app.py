@@ -13,7 +13,9 @@ import plotly.graph_objects as go
 
 from src.data_loader import load_btc_csv, DataLoadError
 from src.preprocessing import resample_granularity, train_test_split
-from src.models.prophet_model import train_prophet_auto, train_prophet_manual, make_forecast
+from src.models.prophet_model import train_prophet_auto, make_forecast as make_prophet_forecast
+from src.models.arima_model import train_arima, make_arima_forecast
+from src.models.xgboost_model import train_xgboost, make_xgboost_forecast
 from src.evaluation import compute_metrics
 
 # ── Must be the very first Streamlit call ──────────────────────────────
@@ -255,6 +257,12 @@ with st.sidebar:
         help="Which OHLC price to forecast",
     )
 
+    start_year = st.slider(
+        "Train from year",
+        min_value=2012, max_value=2024, value=2020,
+        help="Skip older data — pre-2020 BTC was a different market (no ETFs, no institutions)",
+    )
+
     st.divider()
 
     # ── Section 2: Model ─────────────────────────────────────────────
@@ -371,6 +379,11 @@ except Exception as e:
     st.error(f"**Unexpected error:** {e}")
     st.stop()
 
+# Apply the user's date filter (recency-weighted training)
+df = df[df["ds"].dt.year >= start_year].reset_index(drop=True)
+if len(df) < 100:
+    st.warning(f"Only {len(df)} rows after filtering from {start_year}. Forecasts may be unreliable.")
+
 # ── Summary metric row ─────────────────────────────────────────────────
 latest = df["y"].iloc[-1]
 prev   = df["y"].iloc[-2]
@@ -480,28 +493,50 @@ if generate:
     st.markdown("---")
     st.subheader(f"🔮 {model_choice} Forecast — {granularity} Granularity")
 
-    if model_choice != "Prophet":
-        st.info(f"⚡ {model_choice} model coming on Day 3. Showing Prophet for now.")
-
     # Step 1: Resample to chosen granularity (Daily / Weekly / Monthly)
     df_resampled = resample_granularity(df, granularity)
 
     # Step 2: Chronological 80/20 split (paper Section 3.3)
-    train, test = train_test_split(df_resampled)
+    try:
+        train, test = train_test_split(df_resampled)
+    except ValueError as e:
+        st.error(
+            f"⚠️ **Not enough data for {granularity} forecasting:** {e}. "
+            f"Try a wider date range (lower the 'Train from year' slider) "
+            f"or pick **Daily** granularity."
+        )
+        st.stop()
 
-    # Step 3: Train Prophet (Auto mode for now)
-    with st.spinner(f"Training Prophet on {len(train):,} {granularity.lower()} records..."):
-        model, train_time = train_prophet_auto(train, confidence=confidence)
-
-    # Step 4: Forecast (test horizon + user's future horizon)
     freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
     total_periods = len(test) + horizon
-    forecast = make_forecast(
-        model,
-        horizon_days=total_periods,
-        freq=freq_map[granularity],
-        historical_max=df_resampled["y"].max(),
-    )
+    arima_order = None  # Only set for ARIMA — used in info banner below
+
+    # Step 3 & 4: Train chosen model + generate forecast
+    if model_choice == "Prophet":
+        with st.spinner(f"Training Prophet on {len(train):,} {granularity.lower()} records..."):
+            model, train_time = train_prophet_auto(train, confidence=confidence)
+            forecast = make_prophet_forecast(
+                model,
+                horizon_days=total_periods,
+                freq=freq_map[granularity],
+                historical_max=df_resampled["y"].max(),
+            )
+
+    elif model_choice == "ARIMA":
+        with st.spinner(f"Training ARIMA (auto-selecting p, d, q) — this may take 30-60s..."):
+            model, train_time, arima_order = train_arima(train)
+            forecast = make_arima_forecast(
+                model, train, horizon=total_periods, confidence=confidence,
+            )
+
+    elif model_choice == "XGBoost":
+        with st.spinner(f"Training XGBoost on {len(train):,} {granularity.lower()} records..."):
+            model, train_time = train_xgboost(train)
+            forecast = make_xgboost_forecast(model, train, horizon=total_periods)
+
+    # Show model-specific info
+    if arima_order is not None:
+        st.caption(f"📐 Auto-selected ARIMA order (p, d, q) = **{arima_order}**")
 
     # Step 5: Compute metrics on the test set (backtesting)
     test_forecast = forecast[forecast["ds"].isin(test["ds"])].set_index("ds")
@@ -575,7 +610,7 @@ if generate:
         yaxis=dict(
             title="Price (USD)", showgrid=True, gridcolor="#1e293b",
             tickprefix="$", tickformat=",.0f",
-            range=[0, max(df_resampled["y"].max(), forecast["yhat_upper"].quantile(0.99)) * 1.1],
+            range=[0, df_resampled["y"].max() * 1.5],
         ),
         legend=dict(bgcolor="rgba(13,17,23,0.8)", bordercolor="#1e293b", borderwidth=1),
         hovermode="x unified",
