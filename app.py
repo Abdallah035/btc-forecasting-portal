@@ -25,7 +25,52 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+def _train_and_evaluate(model_name, train, test, granularity, confidence, future_horizon=0):
+    """
+    Train a model and return metrics + FUTURE predictions.
 
+    Returns
+    -------
+    dict with keys:
+        MAE, MAPE, MSE, RMSE, R2, train_time  (metrics on test set)
+        future_forecast  (DataFrame of predictions beyond the data)
+    """
+    freq_map = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
+    # Predict both the test period (for metrics) + future_horizon (for display)
+    total_periods = len(test) + future_horizon
+
+    if model_name == "Prophet":
+        model, train_time = train_prophet_auto(train, confidence=confidence)
+        forecast = make_prophet_forecast(
+            model, horizon_days=total_periods, freq=freq_map[granularity],
+            historical_max=train["y"].max() * 2,
+        )
+    elif model_name == "ARIMA":
+        model, train_time, _ = train_arima(train)
+        forecast = make_arima_forecast(model, train, horizon=total_periods, confidence=confidence)
+    elif model_name == "XGBoost":
+        model, train_time = train_xgboost(train)
+        forecast = make_xgboost_forecast(model, train, horizon=total_periods)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    # Match predictions to actuals by date (for metrics)
+    test_forecast = forecast[forecast["ds"].isin(test["ds"])].set_index("ds")
+    test_actual = test.set_index("ds")
+    common_dates = test_actual.index.intersection(test_forecast.index)
+
+    metrics = compute_metrics(
+        test_actual.loc[common_dates, "y"],
+        test_forecast.loc[common_dates, "yhat"],
+    )
+    metrics["train_time"] = train_time
+
+    # Extract only the TRUE FUTURE predictions (beyond test set)
+    last_actual_date = test["ds"].max()
+    future_forecast = forecast[forecast["ds"] > last_actual_date].head(future_horizon)
+    metrics["future_forecast"] = future_forecast[["ds", "yhat"]].reset_index(drop=True)
+
+    return metrics
 # ── Global CSS injection ───────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -264,6 +309,8 @@ with st.sidebar:
     )
 
     st.divider()
+    generate = st.button("⚡ Generate Forecast", type="primary", use_container_width=True)
+    compare_all = st.button("📊 Compare All 3 Models", use_container_width=True)
 
     # ── Section 2: Model ─────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">② Model Selection</div>', unsafe_allow_html=True)
@@ -311,9 +358,6 @@ with st.sidebar:
     with col_b:
         show_sma_50 = st.checkbox("SMA 50")
         show_ema_20 = st.checkbox("EMA 20")
-
-    st.divider()
-    generate = st.button("⚡ Generate Forecast", type="primary", use_container_width=True)
 
     # Footer
     st.markdown("""
@@ -625,3 +669,164 @@ if generate:
         for col in ["Predicted Price", "Lower Bound", "Upper Bound"]:
             future_only[col] = future_only[col].apply(lambda x: f"${x:,.2f}")
         st.dataframe(future_only.head(horizon), use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# COMPARE ALL MODELS
+# ══════════════════════════════════════════════════════════════════════
+if compare_all:
+    st.markdown("---")
+    st.subheader("📊 Model Comparison — All 3 Algorithms")
+
+    # Use same data prep as the forecast
+    df_resampled = resample_granularity(df, granularity)
+
+    try:
+        train, test = train_test_split(df_resampled)
+    except ValueError as e:
+        st.error(f"⚠️ Not enough data: {e}")
+        st.stop()
+
+    # Train and evaluate each model
+    results = {}
+    progress_bar = st.progress(0, text="Starting model comparison...")
+
+    for i, model_name in enumerate(["Prophet", "ARIMA", "XGBoost"]):
+        progress_bar.progress(i / 3, text=f"Training {model_name}...")
+        try:
+            results[model_name] = _train_and_evaluate(
+                model_name, train, test, granularity, confidence,
+                future_horizon=horizon,
+            )
+        except Exception as e:
+            st.warning(f"{model_name} failed: {e}")
+            results[model_name] = None
+
+    progress_bar.progress(1.0, text="Comparison complete!")
+    progress_bar.empty()
+
+    # Filter to only successful models
+    successful = {k: v for k, v in results.items() if v is not None}
+    if not successful:
+        st.error("All models failed. Try different settings.")
+        st.stop()
+
+    # ── Winner announcement ────────────────────────────────────────────
+    best_mae = min(successful.items(), key=lambda x: x[1]["MAE"])
+    best_mape = min(successful.items(), key=lambda x: x[1]["MAPE"])
+    best_r2 = max(successful.items(), key=lambda x: x[1]["R2"])
+    fastest = min(successful.items(), key=lambda x: x[1]["train_time"])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🏆 Best MAE",  best_mae[0],  f"${best_mae[1]['MAE']:,.0f}")
+    col2.metric("🏆 Best MAPE", best_mape[0], f"{best_mape[1]['MAPE']:.1f}%")
+    col3.metric("🏆 Best R²",   best_r2[0],   f"{best_r2[1]['R2']:.3f}")
+    col4.metric("⚡ Fastest",   fastest[0],   f"{fastest[1]['train_time']:.1f}s")
+
+    # ── Detailed comparison table ──────────────────────────────────────
+    comp_df = pd.DataFrame(successful).T
+    comp_df = comp_df[["MAE", "RMSE", "MAPE", "R2", "train_time"]]
+    comp_df.columns = ["MAE ($)", "RMSE ($)", "MAPE (%)", "R²", "Train Time (s)"]
+    st.dataframe(
+        comp_df.style.format({
+            "MAE ($)": "${:,.0f}",
+            "RMSE ($)": "${:,.0f}",
+            "MAPE (%)": "{:.2f}%",
+            "R²": "{:.3f}",
+            "Train Time (s)": "{:.1f}s",
+        }),
+        use_container_width=True,
+    )
+
+    # ── Grouped bar chart ──────────────────────────────────────────────
+    st.markdown("### Metric Comparison")
+
+    models = list(successful.keys())
+    fig_comp = go.Figure()
+
+    metric_colors = {"MAE": "#f7931a", "RMSE": "#38bdf8", "MAPE": "#a78bfa"}
+
+    for metric, color in metric_colors.items():
+        values = [successful[m][metric] for m in models]
+        max_val = max(values) if max(values) > 0 else 1
+        normalized = [(max_val - v) / max_val * 100 for v in values]
+        fig_comp.add_trace(go.Bar(
+            name=f"{metric} (inverted score)",
+            x=models,
+            y=normalized,
+            marker_color=color,
+            text=[f"${v:,.0f}" if metric != "MAPE" else f"{v:.1f}%" for v in values],
+            textposition="outside",
+        ))
+
+    fig_comp.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,14,26,0.8)",
+        height=400,
+        barmode="group",
+        yaxis=dict(title="Performance Score (higher = better)", gridcolor="#1e293b"),
+        xaxis=dict(gridcolor="#1e293b"),
+        legend=dict(bgcolor="rgba(13,17,23,0.8)"),
+    )
+    st.plotly_chart(fig_comp, use_container_width=True)
+
+    st.caption(
+        "💡 **How to read this chart:** Bars are normalized so taller = better. "
+        "Original values shown on top of bars."
+    )
+
+    # ── Side-by-side future predictions ────────────────────────────────
+    st.markdown(f"### 🔮 Future Predictions — Next {horizon} {granularity.lower()} periods")
+
+    # Merge all 3 models' future forecasts into one DataFrame
+    future_df = None
+    for model_name, res in successful.items():
+        fc = res["future_forecast"].rename(columns={"yhat": model_name})
+        if future_df is None:
+            future_df = fc
+        else:
+            future_df = future_df.merge(fc, on="ds", how="outer")
+
+    future_df = future_df.sort_values("ds").reset_index(drop=True)
+    future_df.rename(columns={"ds": "Date"}, inplace=True)
+
+    # Format prices as USD
+    styled = future_df.style.format({
+        col: "${:,.2f}" for col in future_df.columns if col != "Date"
+    }).format({"Date": lambda d: d.strftime("%Y-%m-%d")})
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Plot all 3 forecasts on same chart
+    st.markdown("### 📈 Forecast Lines Side-by-Side")
+
+    fig_lines = go.Figure()
+    model_colors = {"Prophet": "#f7931a", "ARIMA": "#38bdf8", "XGBoost": "#a78bfa"}
+
+    # Historical context
+    fig_lines.add_trace(go.Scatter(
+        x=df_resampled["ds"].tail(90), y=df_resampled["y"].tail(90),
+        mode="lines", name="Historical (last 90)",
+        line=dict(color="#64748b", width=1.5, dash="dot"),
+    ))
+
+    for model_name in successful:
+        fc = successful[model_name]["future_forecast"]
+        fig_lines.add_trace(go.Scatter(
+            x=fc["ds"], y=fc["yhat"],
+            mode="lines+markers", name=model_name,
+            line=dict(color=model_colors.get(model_name, "#ffffff"), width=2.5),
+            marker=dict(size=5),
+        ))
+
+    fig_lines.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(10,14,26,0.8)",
+        height=450,
+        yaxis=dict(title="Price (USD)", tickprefix="$", tickformat=",.0f", gridcolor="#1e293b"),
+        xaxis=dict(gridcolor="#1e293b"),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_lines, use_container_width=True)
