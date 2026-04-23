@@ -1,27 +1,17 @@
 """
-Prophet forecasting model — log transform with capped uncertainty.
+Prophet forecasting model — optimized for BTC based on research.
 
-Inspired by Yenidogan et al. (2023) Section 3.3.2, adapted for our
-14-year BTC-USD dataset (vs paper's 2-year BTC-IDR).
+Optimizations over Yenidogan et al. (2023) defaults:
+    1. Log transformation for exponential growth stability
+    2. Logistic growth with cap/floor (not linear — BTC has saturation)
+    3. changepoint_prior_scale = 0.001 (research-backed for crypto)
+    4. Auto-disable yearly seasonality when data is too short
+    5. seasonality_prior_scale = 0.1 (tight — prevents overfit to noise)
 
-KEY ADAPTATIONS FOR OUR DATA:
-    1. Log transform: model log(price), exponentiate at the end
-       Reason: BTC grew 600x ($200 -> $120k) — linear models can't
-       extrapolate that. log(price) only changes by ~6.4x.
-
-    2. Tight changepoint_prior_scale (0.05 default)
-       Reason: On log scale, default prior is appropriate. Higher
-       values caused exponential blow-up in confidence bands.
-
-    3. Cap weekly_seasonality and yearly_seasonality with low priors
-       Reason: BTC has no real weekly cycle; yearly is dominated by
-       random news, not pattern. Letting Prophet fit them aggressively
-       creates oscillating predictions.
-
-    4. n_changepoints reduced to 25 (Prophet default)
-       Reason: With log transform, fewer changepoints prevent overfit.
-
-Prophet model: y(t) = g(t) + s(t) + h(t) + e(t)
+Research sources:
+    - https://medium.com/@alexzap922/btc-price-prediction-using-fb-prophet
+    - Facebook Prophet GitHub Issue #797 (high-variance data handling)
+    - Facebook Prophet GitHub Issue #859 (logistic vs linear growth)
 """
 import time
 from typing import Tuple
@@ -30,30 +20,27 @@ import pandas as pd
 from prophet import Prophet
 
 
-def _log_transform(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply natural log to 'y' column."""
+def _prepare_training_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply log transform and add cap/floor for logistic growth.
+
+    Logistic growth needs:
+        - 'cap':   upper saturation (we use 2x historical max)
+        - 'floor': lower saturation (0 — BTC cannot go negative)
+    """
     out = df[["ds", "y"]].copy()
     out["y"] = np.log(out["y"])
+    # In log space, cap is log(2 * real_max), floor is log(0.01) ≈ minimum plausible price
+    real_max = np.exp(out["y"].max())
+    out["cap"] = np.log(real_max * 2)
+    out["floor"] = np.log(0.01)  # $0.01 minimum (practically zero)
     return out
 
 
-def _build_model(
-    changepoint_prior_scale: float,
-    seasonality_mode: str,
-    n_changepoints: int,
-    confidence: float,
-) -> Prophet:
-    """Construct a Prophet model with our standard configuration."""
-    return Prophet(
-        changepoint_prior_scale=changepoint_prior_scale,
-        seasonality_mode=seasonality_mode,
-        n_changepoints=n_changepoints,
-        interval_width=confidence,
-        daily_seasonality=False,
-        weekly_seasonality=False,   # BTC has no real weekly pattern
-        yearly_seasonality=True,
-        seasonality_prior_scale=1.0,  # tight — don't over-fit seasons
-    )
+def _has_enough_yearly_data(train_df: pd.DataFrame) -> bool:
+    """Check if we have at least 2 full years of data for yearly seasonality."""
+    span_days = (train_df["ds"].max() - train_df["ds"].min()).days
+    return span_days >= 730  # 2 years
 
 
 def train_prophet_auto(
@@ -61,18 +48,23 @@ def train_prophet_auto(
     confidence: float = 0.95,
 ) -> Tuple[Prophet, float]:
     """
-    Train Prophet with sensible defaults for log-scale BTC.
+    Train Prophet with research-optimized defaults.
 
-    Auto means: user does not tune, we apply our calibrated defaults.
+    Uses logistic growth on log-transformed prices — the combination that
+    research shows works best for exponentially growing volatile assets.
     """
     start = time.time()
-    log_train = _log_transform(train_df)
+    log_train = _prepare_training_data(train_df)
 
-    model = _build_model(
-        changepoint_prior_scale=0.05,
-        seasonality_mode="additive",
-        n_changepoints=25,
-        confidence=confidence,
+    model = Prophet(
+        growth="logistic",                      # saturation-aware growth
+        changepoint_prior_scale=0.001,          # research-backed value
+        seasonality_prior_scale=0.1,            # tight seasonality
+        seasonality_mode="additive",            # on log scale
+        interval_width=confidence,
+        daily_seasonality=False,
+        weekly_seasonality=False,               # BTC has no real weekly cycle
+        yearly_seasonality=_has_enough_yearly_data(log_train),
     )
     model.fit(log_train)
 
@@ -82,36 +74,29 @@ def train_prophet_auto(
 
 def train_prophet_manual(
     train_df: pd.DataFrame,
-    changepoint_prior_scale: float = 0.05,
+    changepoint_prior_scale: float = 0.001,
     seasonality_mode: str = "additive",
     n_changepoints: int = 25,
     confidence: float = 0.95,
 ) -> Tuple[Prophet, float]:
     """
-    Train Prophet with user-tuned parameters on log-transformed prices.
+    Train Prophet with user-tuned parameters.
 
-    All sliders apply to LOG-SPACE — small values produce stable forecasts.
-
-    Parameters
-    ----------
-    changepoint_prior_scale : float, default=0.05
-        Trend flexibility on log scale. Range: 0.001 - 0.5.
-        Stay BELOW 0.1 to avoid exponential blow-up.
-    seasonality_mode : {'additive', 'multiplicative'}
-        On log-space, 'additive' is the right choice.
-    n_changepoints : int, default=25
-        Prophet's default. Higher values cause overfitting on log data.
-    confidence : float, default=0.95
-        Width of uncertainty interval.
+    Defaults research-backed for BTC. Users can override via sidebar.
     """
     start = time.time()
-    log_train = _log_transform(train_df)
+    log_train = _prepare_training_data(train_df)
 
-    model = _build_model(
+    model = Prophet(
+        growth="logistic",
         changepoint_prior_scale=changepoint_prior_scale,
+        seasonality_prior_scale=0.1,
         seasonality_mode=seasonality_mode,
         n_changepoints=n_changepoints,
-        confidence=confidence,
+        interval_width=confidence,
+        daily_seasonality=False,
+        weekly_seasonality=False,
+        yearly_seasonality=_has_enough_yearly_data(log_train),
     )
     model.fit(log_train)
 
@@ -128,18 +113,20 @@ def make_forecast(
     """
     Generate predictions and back-transform from log to real prices.
 
-    Parameters
-    ----------
-    historical_max : float, optional
-        If provided, caps the upper confidence band at 3x this value.
-        Prevents exponential blow-up of uncertainty intervals.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: ds, yhat, yhat_lower, yhat_upper (real USD prices)
+    For logistic growth, future dates need cap and floor columns too.
     """
     future = model.make_future_dataframe(periods=horizon_days, freq=freq)
+
+    # Logistic growth requires cap/floor on the future DataFrame
+    # We derive them from the model's training state
+    if historical_max is not None:
+        future["cap"] = np.log(historical_max * 2)
+        future["floor"] = np.log(0.01)
+    else:
+        # Fallback — use the model's own history_ if available
+        future["cap"] = model.history["cap"].iloc[0] if "cap" in model.history else np.log(1e7)
+        future["floor"] = model.history["floor"].iloc[0] if "floor" in model.history else np.log(0.01)
+
     forecast = model.predict(future)
     forecast = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
 
@@ -147,9 +134,9 @@ def make_forecast(
     for col in ["yhat", "yhat_lower", "yhat_upper"]:
         forecast[col] = np.exp(forecast[col])
 
-    # Cap exploded confidence bands at 3x historical high (sanity check)
+    # Cap upper band at 5x historical max to prevent visual explosion
     if historical_max is not None:
-        cap = historical_max * 3
+        cap = historical_max * 5
         forecast["yhat_upper"] = forecast["yhat_upper"].clip(upper=cap)
         forecast["yhat"] = forecast["yhat"].clip(upper=cap)
 

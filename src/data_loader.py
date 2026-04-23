@@ -17,16 +17,33 @@ def detect_date_column(df: pd.DataFrame) -> str:
     """
     Find which column contains the dates.
 
-    Strategy: lowercase all column names, look for any that match
-    common date column names. Return the first match.
+    Strategy (in order of priority):
+    1. Exact match (e.g. 'Date', 'Timestamp')
+    2. Partial match (e.g. 'Open time' contains 'time') — handles Binance format
+    3. Column with 'open' + 'time' together (Binance OHLCV format) is preferred
+       over 'Close time' to use the start-of-candle timestamp.
     """
+    # Pass 1: exact match
     for col in df.columns:
-        if col.lower() in DATE_COLUMN_CANDIDATES:
+        if col.lower().strip() in DATE_COLUMN_CANDIDATES:
             return col
+
+    # Pass 2: Binance format — prefer "Open time" over "Close time"
+    for col in df.columns:
+        low = col.lower().strip()
+        if "open" in low and ("time" in low or "date" in low):
+            return col
+
+    # Pass 3: any column containing a date keyword
+    for col in df.columns:
+        low = col.lower().strip()
+        if any(keyword in low for keyword in DATE_COLUMN_CANDIDATES):
+            return col
+
     raise DataLoadError(
-         f"No date column found. Expected one of: {DATE_COLUMN_CANDIDATES}. "
-        f"Got columns: {list(df.columns)}"
-    )        
+        f"No date column found. Expected a column containing one of: "
+        f"{DATE_COLUMN_CANDIDATES}. Got columns: {list(df.columns)}"
+    )
 
 def detect_price_columns(df: pd.DataFrame) -> list:
     """Return list of candidate price columns found in the dataframe."""
