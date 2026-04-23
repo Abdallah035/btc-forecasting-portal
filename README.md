@@ -6,6 +6,9 @@
 
 *Replicates and extends **Yenidogan et al. (2023)** — "Comparative Analysis of ARIMA and Prophet Algorithms in Bitcoin Price Forecasting"*
 
+### [🚀 Launch Live Demo ↗](https://btc-forecasting-app-eiaig8h9pvydmwjryanx6x.streamlit.app/)
+
+![Live Demo](https://img.shields.io/badge/demo-live-2ea043?style=for-the-badge&logo=streamlit&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![Streamlit](https://img.shields.io/badge/streamlit-1.39-ff4b4b.svg)
 ![Plotly](https://img.shields.io/badge/plotly-5.24-3f4f75.svg)
@@ -57,11 +60,17 @@ Built as a replication and extension of **Yenidogan et al. (2023)**, this projec
 
 ---
 
-## Quick Start
+## Try It Live
+
+👉 **[btc-forecasting-app.streamlit.app](https://btc-forecasting-app-eiaig8h9pvydmwjryanx6x.streamlit.app/)**
+
+No installation needed — upload a Kaggle BTC CSV directly in the browser.
+
+## Run Locally
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/btc-forecasting-portal
+git clone https://github.com/Abdallah035/btc-forecasting-portal
 cd btc-forecasting-portal
 
 # Create a virtual environment
