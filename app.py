@@ -533,7 +533,11 @@ with st.expander("📋 Preview Raw Data"):
 # ══════════════════════════════════════════════════════════════════════
 # FORECAST GENERATION
 # ══════════════════════════════════════════════════════════════════════
-if generate:
+# Run the forecast if button was clicked — OR if we have a cached forecast from a previous click
+if generate or st.session_state.get("has_forecast", False):
+    if generate:
+        # fresh click — clear any old state
+        st.session_state["has_forecast"] = True
     st.markdown("---")
     st.subheader(f"🔮 {model_choice} Forecast — {granularity} Granularity")
 
@@ -556,27 +560,40 @@ if generate:
     arima_order = None  # Only set for ARIMA — used in info banner below
 
     # Step 3 & 4: Train chosen model + generate forecast
-    if model_choice == "Prophet":
-        with st.spinner(f"Training Prophet on {len(train):,} {granularity.lower()} records..."):
-            model, train_time = train_prophet_auto(train, confidence=confidence)
-            forecast = make_prophet_forecast(
-                model,
-                horizon_days=total_periods,
-                freq=freq_map[granularity],
-                historical_max=df_resampled["y"].max(),
-            )
+    # Use session_state to avoid retraining on every button click (e.g. download buttons)
+    cache_key = (model_choice, granularity, start_year, horizon, confidence, price_column)
 
-    elif model_choice == "ARIMA":
-        with st.spinner(f"Training ARIMA (auto-selecting p, d, q) — this may take 30-60s..."):
-            model, train_time, arima_order = train_arima(train)
-            forecast = make_arima_forecast(
-                model, train, horizon=total_periods, confidence=confidence,
-            )
+    if generate or st.session_state.get("last_cache_key") != cache_key:
+        if model_choice == "Prophet":
+            with st.spinner(f"Training Prophet on {len(train):,} {granularity.lower()} records..."):
+                model, train_time = train_prophet_auto(train, confidence=confidence)
+                forecast = make_prophet_forecast(
+                    model,
+                    horizon_days=total_periods,
+                    freq=freq_map[granularity],
+                    historical_max=df_resampled["y"].max(),
+                )
+        elif model_choice == "ARIMA":
+            with st.spinner(f"Training ARIMA (auto-selecting p, d, q) — this may take 30-60s..."):
+                model, train_time, arima_order = train_arima(train)
+                forecast = make_arima_forecast(
+                    model, train, horizon=total_periods, confidence=confidence,
+                )
+        elif model_choice == "XGBoost":
+            with st.spinner(f"Training XGBoost on {len(train):,} {granularity.lower()} records..."):
+                model, train_time = train_xgboost(train)
+                forecast = make_xgboost_forecast(model, train, horizon=total_periods)
 
-    elif model_choice == "XGBoost":
-        with st.spinner(f"Training XGBoost on {len(train):,} {granularity.lower()} records..."):
-            model, train_time = train_xgboost(train)
-            forecast = make_xgboost_forecast(model, train, horizon=total_periods)
+        # Cache everything in session_state
+        st.session_state["last_cache_key"] = cache_key
+        st.session_state["forecast"] = forecast
+        st.session_state["train_time"] = train_time
+        st.session_state["arima_order"] = arima_order
+    else:
+        # Re-use cached forecast (download button clicked, no retraining needed)
+        forecast = st.session_state["forecast"]
+        train_time = st.session_state["train_time"]
+        arima_order = st.session_state.get("arima_order")
 
     # Show model-specific info
     if arima_order is not None:
@@ -669,6 +686,30 @@ if generate:
         for col in ["Predicted Price", "Lower Bound", "Upper Bound"]:
             future_only[col] = future_only[col].apply(lambda x: f"${x:,.2f}")
         st.dataframe(future_only.head(horizon), use_container_width=True, hide_index=True)
+
+    # ── Download buttons ──────────────────────────────────────────────
+    col_dl1, col_dl2 = st.columns(2)
+
+    # Download forecast as CSV (raw numeric values, not formatted strings)
+    future_raw = forecast[forecast["ds"] > df_resampled["ds"].max()].copy()
+    csv_data = future_raw.to_csv(index=False).encode("utf-8")
+    col_dl1.download_button(
+        label="📥 Download Forecast (CSV)",
+        data=csv_data,
+        file_name=f"btc_forecast_{model_choice}_{granularity}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Download chart as interactive HTML (Plotly export)
+    chart_html = fig_fc.to_html(include_plotlyjs="cdn")
+    col_dl2.download_button(
+        label="📊 Download Chart (HTML)",
+        data=chart_html,
+        file_name=f"btc_forecast_chart_{model_choice}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
